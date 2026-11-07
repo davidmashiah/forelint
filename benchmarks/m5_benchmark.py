@@ -80,7 +80,9 @@ def main(path, store="CA_1", dept="FOODS_3"):
     te["Naive28"] = te["lag28"]
     last = tr.groupby("item_id")["y"].apply(lambda s: s.iloc[-28:].mean())
     te["MA28"] = te["item_id"].map(last)
-    rep = fl.audit(te, ["GBM", "Naive28"], baseline="MA28", y="y", id_col="item_id", time_col="ds")
+    hist = df[df.ds <= cut][["item_id", "ds", "y"]]
+    rep = fl.audit(te, ["GBM", "Naive28"], baseline="MA28", y="y", id_col="item_id", time_col="ds",
+                   train=hist, segments="demand_class")
     print("3.", rep, "\n")
 
     # 4. Is the GBM really better than the moving average?

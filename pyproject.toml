@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "forelint"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lint your forecast backtests: leakage between related series, the run-to-run noise floor, model comparison tests, and per-item bias before you trust a score."
 readme = "README.md"
 license = "MIT"

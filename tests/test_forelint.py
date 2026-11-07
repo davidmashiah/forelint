@@ -174,3 +174,67 @@ def test_split_optimism_exposes_entity_leak():
     out = fl.split_optimism(model, X, y, groups=g, time=t, n_splits=3)
     assert out.loc["random", "vs_reference"] < 0.5   # random CV hides most of the error
     assert out.loc["group", "vs_reference"] > 0.7
+
+
+# ── demand classes (Syntetos-Boylan cut-offs 1.32 and 0.49) ─────────────────
+def test_classify_demand_four_classes():
+    rows = []
+    series = {
+        "smooth": [5, 5, 5, 5, 5, 5],            # ADI 1, CV2 0
+        "erratic": [1, 9, 1, 9, 1, 9],           # ADI 1, CV2 0.64
+        "intermittent": [0, 0, 5, 0, 0, 5],      # ADI 3, CV2 0
+        "lumpy": [0, 0, 1, 0, 0, 9],             # ADI 3, CV2 0.64
+        "none": [0, 0, 0, 0, 0, 0],
+    }
+    for k, v in series.items():
+        rows += [{"unique_id": k, "ds": t, "y": x} for t, x in enumerate(v)]
+    out = fl.classify_demand(pd.DataFrame(rows))
+    assert out.loc["smooth", "demand_class"] == "smooth"
+    assert out.loc["erratic", "demand_class"] == "erratic"
+    assert out.loc["intermittent", "demand_class"] == "intermittent"
+    assert out.loc["lumpy", "demand_class"] == "lumpy"
+    assert out.loc["none", "demand_class"] == "no demand"
+    assert out.loc["lumpy", "adi"] == pytest.approx(3.0)
+    assert out.loc["lumpy", "cv2"] == pytest.approx(0.64)
+
+
+# ── MASE / RMSSE, hand-checked ──────────────────────────────────────────────
+def test_audit_mase_rmsse():
+    train = pd.DataFrame({"unique_id": "a", "ds": range(4), "y": [1.0, 2, 3, 4]})  # naive diffs all 1
+    test = pd.DataFrame({"unique_id": "a", "ds": [4, 5], "y": [5.0, 6], "m": [7.0, 4]})  # errors +2, -2
+    rep = fl.audit(test, ["m"], train=train)
+    assert rep.summary.loc["m", "mase"] == pytest.approx(2.0)
+    assert rep.summary.loc["m", "rmsse"] == pytest.approx(2.0)
+    assert "RMSSE" in str(rep)
+
+
+def test_audit_seasonal_scale():
+    train = pd.DataFrame({"unique_id": "a", "ds": range(6), "y": [1.0, 5, 1, 5, 2, 6]})  # lag-2 diffs: 0,0,1,1
+    test = pd.DataFrame({"unique_id": "a", "ds": [6], "y": [2.0], "m": [3.0]})
+    rep = fl.audit(test, ["m"], train=train, season_length=2)
+    assert rep.summary.loc["m", "mase"] == pytest.approx(1 / 0.5)
+
+
+# ── stockout-aware scoring ──────────────────────────────────────────────────
+def test_audit_excludes_flagged_rows():
+    df = _eight_days()
+    df["stockout"] = False
+    df.loc[df.ds == 0, "stockout"] = True       # drop the +3 error of day 0
+    rep = fl.audit(df, ["H"], exclude="stockout")
+    assert rep.n_excluded == 1
+    assert rep.summary.loc["H", "bias"] == pytest.approx(13 / 7)
+    assert "excluded" in str(rep)
+
+
+# ── per-segment breakdown ───────────────────────────────────────────────────
+def test_audit_by_segment():
+    rows = []
+    for item, err in [("a", 1.0), ("b", 1.0), ("c", 5.0)]:
+        rows += [{"unique_id": item, "ds": t, "y": 10.0, "m": 10.0 + err, "base": 10.0 + 2} for t in range(3)]
+    rep = fl.audit(pd.DataFrame(rows), ["m"], baseline="base", segments={"a": "fast", "b": "fast", "c": "slow"})
+    seg = rep.by_segment
+    assert seg.loc[("m", "fast"), "mae"] == pytest.approx(1.0)
+    assert seg.loc[("m", "slow"), "mae"] == pytest.approx(5.0)
+    assert seg.loc[("m", "fast"), "fva"] == pytest.approx(0.5)
+    assert seg.loc[("m", "slow"), "fva"] == pytest.approx(-1.5)
+    assert "by segment" in str(rep)

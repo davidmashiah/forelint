@@ -22,6 +22,9 @@ pip install forelint
 | Is this improvement bigger than seed-to-seed noise? | `noise_floor` |
 | Is model A really better than B across many series? | `dm_test`, `diebold_mariano`, `model_confidence_set` |
 | Which items are always over or under forecast? Does the model beat a naive forecast? Where does the error live? | `audit` |
+| Does the model win on steady items and lose on intermittent ones? | `classify_demand`, `audit(segments="demand_class")` |
+| What is the scaled error (MASE, RMSSE) per item? | `audit(train=history)` |
+| How do I score without counting stockout days as low demand? | `audit(exclude="stockout")` |
 
 ## Quickstart
 
@@ -30,7 +33,10 @@ import forelint as fl
 
 # df: one row per item and date, the actual in "y", one column per model,
 # e.g. the output of statsforecast's cross_validation()
-report = fl.audit(df, models=["LightGBM", "ETS"], baseline="SeasonalNaive")
+report = fl.audit(df, models=["LightGBM", "ETS"], baseline="SeasonalNaive",
+                  train=history,              # adds MASE and RMSSE
+                  segments="demand_class",    # smooth / erratic / intermittent / lumpy
+                  exclude="stockout")         # optional: skip stockout periods
 print(report)
 
 # Is LightGBM really better than the seasonal naive, or is it noise?
@@ -58,7 +64,14 @@ Measured, not assumed:
   added was **−0.1%** on MAE, the model was worse than the moving average on
   **49% of items**, and Diebold-Mariano gives **p = 0.31**. The model
   confidence set keeps both. An average-MAE table alone would not show this.
+- **The average hid a split by demand class.** Against the moving average, the
+  model added **+6.2%** on the 156 smooth items but **−3.0%** on the 491
+  intermittent items and **−5.0%** on the 146 lumpy ones, losing on more than
+  half of each. Intermittent items are 60% of this store. The overall −0.1% was
+  the two cancelling out.
 - **It under-forecasts by 9.3%** of actual sales.
+- **RMSSE** (M5's official metric) is 0.911 for the model against 0.907 for the
+  moving average.
 - **10% of items hold 73% of the squared error.**
 - **The noise floor is small here:** over 10 seeds the MAE sd is 0.0014, so
   any change under 0.0045 is noise.

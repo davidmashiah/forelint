@@ -1,5 +1,7 @@
 # forelint
 
+[![PyPI](https://img.shields.io/pypi/v/forelint.svg)](https://pypi.org/project/forelint/) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24044928.svg)](https://doi.org/10.5281/zenodo.24044928)
+
 **Lint your forecast backtests before you trust a score.**
 
 forelint checks the things a backtest score hides: leakage between related
@@ -87,6 +89,12 @@ Background: [My validation ranked five models backwards](https://davidmashiah.co
 - `model_confidence_set` follows Hansen, Lunde and Nason (2011) with the
   T_max statistic and a moving-block bootstrap. Its kept set matches
   `arch.bootstrap.MCS` in the test suite.
+
+## Cite
+
+If forelint helps your work, please cite it:
+
+> Mashiah, D. (2026). forelint: lint your forecast backtests before you trust a score (0.1.0). Zenodo. https://doi.org/10.5281/zenodo.24044928
 
 ## Status
 

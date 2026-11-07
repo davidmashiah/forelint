@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use forelint, please cite it as below."
+title: "forelint: lint your forecast backtests before you trust a score"
+type: software
+authors:
+  - family-names: Mashiah
+    given-names: David
+    orcid: "https://orcid.org/0009-0004-4684-955X"
+version: 0.1.0
+doi: 10.5281/zenodo.24044928
+date-released: 2026-11-08
+license: MIT
+repository-code: "https://github.com/davidmashiah/forelint"
+url: "https://github.com/davidmashiah/forelint"
+keywords:
+  - forecasting
+  - forecast evaluation
+  - time series cross-validation
+  - data leakage
+  - Diebold-Mariano test
+  - model confidence set

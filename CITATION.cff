@@ -6,8 +6,8 @@ authors:
   - family-names: Mashiah
     given-names: David
     orcid: "https://orcid.org/0009-0004-4684-955X"
-version: 0.1.0
-doi: 10.5281/zenodo.24044928
+version: 0.2.0
+doi: 10.5281/zenodo.24044927
 date-released: 2026-11-08
 license: MIT
 repository-code: "https://github.com/davidmashiah/forelint"

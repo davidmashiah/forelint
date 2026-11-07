@@ -1,6 +1,6 @@
 # forelint
 
-[![PyPI](https://img.shields.io/pypi/v/forelint.svg)](https://pypi.org/project/forelint/) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24044928.svg)](https://doi.org/10.5281/zenodo.24044928)
+[![PyPI](https://img.shields.io/pypi/v/forelint.svg)](https://pypi.org/project/forelint/) [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24044927.svg)](https://doi.org/10.5281/zenodo.24044927)
 
 **Lint your forecast backtests before you trust a score.**
 
@@ -107,7 +107,7 @@ Background: [My validation ranked five models backwards](https://davidmashiah.co
 
 If forelint helps your work, please cite it:
 
-> Mashiah, D. (2026). forelint: lint your forecast backtests before you trust a score (0.1.0). Zenodo. https://doi.org/10.5281/zenodo.24044928
+> Mashiah, D. (2026). forelint: lint your forecast backtests before you trust a score. Zenodo. https://doi.org/10.5281/zenodo.24044927
 
 ## Status
 

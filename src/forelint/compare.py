@@ -92,25 +92,34 @@ def diebold_mariano(errors_a, errors_b, h=1, loss="squared") -> DMResult:
     return _dm_from_diff(_LOSSES[loss](ea) - _LOSSES[loss](eb), h)
 
 
-def origin_means(values, cutoff, time):
-    """Mean of `values` per forecast origin, thinned to origins whose windows do not overlap.
+def origin_means(values, cutoff, time, ids=None):
+    """Mean of `values` per forecast window, keeping only windows that do not overlap.
 
-    Returns (series indexed by cutoff, overlap) where overlap is
-    ceil(horizon / spacing between cutoffs). When windows overlap, only every
-    overlap-th origin is kept, counting back from the latest, so the kept
-    origins share no target dates and their means are close to independent.
+    Each series' windows are thinned greedily from its latest cutoff backwards:
+    a cutoff is kept only if its window ends no later than the start of the
+    window kept after it, so kept windows share no target dates. Windows are
+    then lined up across series by their position counted back from each
+    series' latest kept window (0 = latest), which also handles series that
+    end on different dates. Returns (means ordered oldest to latest, thinned),
+    where `thinned` is True if any rows were dropped.
     """
-    per = pd.Series(np.asarray(values, dtype=float)).groupby(np.asarray(cutoff)).mean().sort_index()
-    cuts = per.index.to_numpy()
-    if len(cuts) < 2:
-        return per, 1
-    horizon = (pd.Series(np.asarray(time)) - pd.Series(np.asarray(cutoff))).max()
-    step = pd.Series(cuts).diff().dropna().min()
-    overlap = max(1, int(math.ceil(horizon / step))) if step else 1
-    if overlap > 1:
-        keep = np.arange(len(per) - 1, -1, -overlap)[::-1]
-        per = per.iloc[keep]
-    return per, overlap
+    frame = pd.DataFrame({"v": np.asarray(values, dtype=float), "c": np.asarray(cutoff),
+                          "t": np.asarray(time), "id": 0 if ids is None else np.asarray(ids)})
+    horizon = (frame["t"] - frame["c"]).max()
+    rank = {}
+    for item, g in frame.groupby("id", sort=False, observed=True):
+        last = None
+        k = 0
+        for cut in np.sort(g["c"].unique())[::-1]:
+            if last is None or cut + horizon <= last:
+                rank[(item, cut)] = k
+                k += 1
+                last = cut
+    key = pd.Series([rank.get((i, x), -1) for i, x in zip(frame["id"], frame["c"])], index=frame.index)
+    kept = key >= 0
+    per = frame.loc[kept, "v"].groupby(key[kept]).mean().sort_index(ascending=False)
+    per.index.name = "window_from_latest"
+    return per, bool((~kept).any())
 
 
 def dm_test(df, model_a, model_b, *, y="y", id_col="unique_id", time_col="ds", cutoff_col="cutoff",
@@ -139,10 +148,10 @@ def dm_test(df, model_a, model_b, *, y="y", id_col="unique_id", time_col="ds", c
     f = _LOSSES[loss]
     d = f(df[model_a] - df[y]) - f(df[model_b] - df[y])
     if cutoff_col and cutoff_col in df.columns:
-        per, overlap = origin_means(d, df[cutoff_col], df[time_col])
-        if overlap > 1:
-            warnings.warn(f"forecast windows overlap; using {len(per)} non-overlapping origins of "
-                          f"{df[cutoff_col].nunique()}", stacklevel=2)
+        per, thinned = origin_means(d, df[cutoff_col], df[time_col], df[id_col])
+        if thinned:
+            warnings.warn(f"forecast windows overlap; using {len(per)} non-overlapping windows per series",
+                          stacklevel=2)
         if len(per) < 3:
             raise ValueError(f"only {len(per)} non-overlapping forecast origins; the test needs at least 3. "
                              "Backtest with more windows, spaced at least the horizon apart.")

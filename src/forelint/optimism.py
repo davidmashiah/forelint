@@ -17,14 +17,19 @@ what the training data is allowed to contain:
   groups out of training; ``kfold`` draws a same-size sample from every row
   but the test rows, including the held-out groups' other rows.
 
-``optimism`` = 1 − leaky error / honest error, averaged over folds as a ratio
-of mean errors, with a standard error from the per-fold ratios. On data with
-no leak it is close to 0 within about two standard errors.
+``optimism`` = 1 − leaky error / honest error, from the per-fold log error
+ratios averaged with weights proportional to the honest training size, with a
+95% t interval over folds. An interval that excludes 0 on the positive side is
+a detected leak. Negative values mean no detectable leak, not a pessimistic
+split: with small training sets, flexible models such as trees can do worse on
+a scattered sample than on a contiguous block of the past even when the
+sample contains the future.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from sklearn.base import clone
 from sklearn.metrics import get_scorer
 from sklearn.utils import _safe_indexing
@@ -100,7 +105,8 @@ def split_optimism(estimator, X, y, *, groups, time, scoring="neg_mean_absolute_
     -------
     DataFrame indexed by strategy with ``error`` (mean over folds),
     ``error_sd``, ``n_folds``, ``honest`` (the counterpart it is compared
-    with), ``optimism`` (1 − error / counterpart error) and ``optimism_se``.
+    with), ``optimism`` (1 − error / counterpart error) and its 95% interval
+    ``optimism_low``, ``optimism_high``.
     """
     if not (isinstance(scoring, str) and scoring.startswith("neg_")):
         raise ValueError("scoring must be an error scorer name starting with 'neg_', "
@@ -111,9 +117,11 @@ def split_optimism(estimator, X, y, *, groups, time, scoring="neg_mean_absolute_
         raise ValueError(f"unknown strategies: {sorted(unknown)}")
     rng = np.random.default_rng(random_state)
     errs = {s: [] for s in strategies}
+    sizes = {s: [] for s in strategies}
     for fold in _folds(time, groups, n_splits, test_group_frac, gap, rng):
         for s in strategies:
             tr, te = fold[s]
+            sizes[s].append(len(tr))
             if len(tr) == 0 or len(te) == 0:
                 raise ValueError("a fold came out empty; use fewer splits or a larger test_group_frac")
             est = clone(estimator).fit(_safe_indexing(X, tr), _safe_indexing(y, tr))
@@ -122,13 +130,19 @@ def split_optimism(estimator, X, y, *, groups, time, scoring="neg_mean_absolute_
     rows = {}
     for s, e in errs.items():
         h = _PAIRS.get(s)
-        opt = se = np.nan
+        opt = lo = hi = np.nan
         if h in errs:
-            opt = 1 - e.mean() / errs[h].mean()
-            per = 1 - e / errs[h]
-            se = per.std(ddof=1) / np.sqrt(len(per)) if len(per) > 1 else np.nan
+            lr = np.log(e / errs[h])
+            w = np.asarray(sizes[h], dtype=float)
+            m = float(np.average(lr, weights=w))
+            opt = 1 - np.exp(m)
+            if len(lr) > 1:
+                se = lr.std(ddof=1) / np.sqrt(len(lr))
+                q = stats.t.ppf(0.975, df=len(lr) - 1)
+                lo, hi = 1 - np.exp(m + q * se), 1 - np.exp(m - q * se)
         rows[s] = {"error": e.mean(), "error_sd": e.std(ddof=1) if len(e) > 1 else np.nan,
-                   "n_folds": len(e), "honest": h or "", "optimism": opt, "optimism_se": se}
+                   "n_folds": len(e), "honest": h or "", "optimism": opt,
+                   "optimism_low": lo, "optimism_high": hi}
     out = pd.DataFrame.from_dict(rows, orient="index")
     out.index.name = "strategy"
     return out

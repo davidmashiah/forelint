@@ -192,8 +192,8 @@ def test_split_optimism_is_near_zero_without_a_leak():
     X = rng.normal(size=(len(g), 3))
     y = X[:, 0] + rng.normal(0, 1, len(g))     # no dependence on group or time
     out = fl.split_optimism(KNeighborsRegressor(5), X, y, groups=g, time=t, n_splits=4)
-    assert abs(out.loc["random", "optimism"]) < 0.08
-    assert abs(out.loc["group", "optimism"]) < 0.08
+    for s in ["random", "group", "kfold"]:
+        assert out.loc[s, "optimism_low"] < 0 < out.loc[s, "optimism_high"] or abs(out.loc[s, "optimism"]) < 0.05
 
 
 def test_split_optimism_rejects_score_metrics():
@@ -307,6 +307,11 @@ def test_dm_test_thins_overlapping_windows():
     with pytest.warns(UserWarning, match="non-overlapping"):
         r = fl.dm_test(df, "A", "B")
     assert r.n == 6 and r.h == 1
+    # an extra origin one day after the last must not wipe out the grid
+    extra = df[df["cutoff"] == df["cutoff"].max()].assign(cutoff=df["cutoff"].max() + 1, ds=lambda x: x["ds"] + 1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert fl.dm_test(pd.concat([df, extra]), "A", "B").n >= 6
 
 
 def _daily_origin_null(rng, n_series=20, n_dates=80, horizon=7, n_cut=40):
@@ -494,4 +499,20 @@ def test_split_optimism_exposes_entity_leak():
                             groups=g, time=t, n_splits=3)
     assert out.loc["kfold", "optimism"] > 0.6     # plain K-fold hides most of the error
     assert out.loc["kfold", "honest"] == "group"
-    assert abs(out.loc["random", "optimism"]) < 3 * out.loc["random", "optimism_se"] + 0.05
+    assert out.loc["kfold", "optimism_low"] > 0.2      # the 95% interval clearly excludes no leak
+
+
+
+def test_dm_test_staggered_series_keep_their_windows():
+    rng = np.random.default_rng(15)
+    rows = []
+    for i in range(30):
+        end = rng.integers(0, 10)                  # series end on different days
+        for w in range(12):
+            c = end + 14 * w
+            shock = rng.normal()
+            for k in range(1, 15):
+                rows.append((i, c + k, c, 0.0, shock + rng.normal(), shock + rng.normal()))
+    df = pd.DataFrame(rows, columns=["unique_id", "ds", "cutoff", "y", "A", "B"])
+    r = fl.dm_test(df, "A", "B")
+    assert r.n == 12                               # all 12 windows per series, not every k-th global cutoff

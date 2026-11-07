@@ -87,9 +87,9 @@ assumed:
 - **10% of items hold 74% of the squared error.**
 - **The noise floor is small:** over 10 seeds the MAE sd is 0.0027, so a
   difference under 0.0087 between two runs is noise.
-- **Leakage is small for this data:** plain K-fold is 2.6% optimistic
-  (± 0.9%) against holding out the items; random and group splits are within
-  noise. Leakage depends on the features; forelint measures it rather than
+- **Leakage is small for this data:** plain K-fold is 3.3% optimistic against
+  holding out the items (95% interval 0.8% to 5.7%); for random and group
+  splits the interval includes zero. Leakage depends on the features; forelint measures it rather than
   assuming it.
 
 The model is deliberately plain (six features, no tuning). The point is the
@@ -111,8 +111,10 @@ Background: [My validation ranked five models backwards](https://davidmashiah.co
 - With a `cutoff` column, `dm_test` and the audit's bias test use one value
   per forecast origin, because the steps of one forecast share an origin and
   are correlated. When windows overlap (origins closer together than the
-  horizon, such as statsforecast's default `step_size=1`), only origins whose
-  windows do not overlap are used, and at least 3 are needed. Backtest with
+  horizon, such as statsforecast's default `step_size=1`), each series keeps
+  only windows that do not overlap, counted back from its latest, and windows
+  are lined up across series by that position, so series that end on
+  different dates still count fully. At least 3 windows are needed. Backtest with
   `step_size` at least the horizon and ten or more windows. Without a cutoff
   column, every time stamp is treated as a separate one-step forecast.
 - `dm_test` applies Diebold-Mariano with the Harvey-Leybourne-Newbold
@@ -131,7 +133,8 @@ Background: [My validation ranked five models backwards](https://davidmashiah.co
   same test rows and the same number of training rows per group: `random`
   vs `time` (leak through time), `group` vs `group_time` (through other
   entities' future) and `kfold` vs `group` (through the entity itself, what
-  plain K-fold does). It reports a standard error for each optimism figure.
+  plain K-fold does). Each optimism figure comes with a 95% interval over
+  folds; a negative value means no detectable leak, not a pessimistic split.
 - `noise_floor` reports the critical difference, t · √2 · sd: the smallest
   difference between two single runs that is significant.
 

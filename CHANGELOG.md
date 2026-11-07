@@ -5,7 +5,7 @@
 Breaking changes against 0.1.0:
 
 - `split_optimism`: `reference` removed; columns `vs_reference` replaced by
-  `honest`, `optimism` and `optimism_se`; strategies are now matched pairs
+  `honest`, `optimism`, `optimism_low` and `optimism_high`; strategies are now matched pairs
   (`random`/`time`, `group`/`group_time`, `kfold`/`group`).
 - `audit`: `ts_limit` removed and `AuditReport.ts_limit` replaced by
   `bias_alpha`; `n_biased_items` now counts items with significant bias, not
@@ -15,7 +15,8 @@ Breaking changes against 0.1.0:
 Corrections, from two independent reviews before release:
 
 - `dm_test` uses the `cutoff` column: one point per forecast origin, and when
-  windows overlap only non-overlapping origins are used. 0.1.0 treated every
+  windows overlap each series keeps only non-overlapping windows, lined up
+  across series by position from the latest. 0.1.0 treated every
   step of a multi-step forecast as independent and rejected a true null far
   too often. Without a cutoff column it refuses duplicate (id, time) rows.
 - `diebold_mariano` falls back to Newey-West weights when the long-run

@@ -201,13 +201,13 @@ def audit(df, models, *, baseline=None, y="y", id_col="unique_id", time_col="ds"
     # Bias test: with a cutoff column, one mean error per non-overlapping
     # forecast origin; with fewer than 3 such origins there is no valid test.
     if has_cut:
-        kept, overlap = origin_means(np.zeros(len(d)), d[cutoff_col], d[time_col])
+        kept, thinned = origin_means(np.zeros(len(d)), d[cutoff_col], d[time_col], d[id_col])
         if len(kept) < 3:
-            notes.append(f"bias test: only {len(kept)} non-overlapping forecast origin(s); "
+            notes.append(f"bias test: only {len(kept)} non-overlapping forecast window(s) per item; "
                          "per-item bias is not tested (needs 3 or more).")
-        elif overlap > 1:
-            notes.append(f"bias test: forecast windows overlap, so it uses {len(kept)} non-overlapping "
-                         f"origins of {d[cutoff_col].nunique()}.")
+        elif thinned:
+            notes.append(f"bias test: forecast windows overlap, so it uses up to {len(kept)} "
+                         "non-overlapping windows per item.")
     else:
         notes.append("bias test: no cutoff column, so errors are treated as independent one-step "
                      "errors; for multi-step forecasts pass the forecast origin to avoid false alarms.")

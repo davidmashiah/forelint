@@ -1,14 +1,19 @@
 """Is model A really better than model B, or is it noise?
 
 `diebold_mariano` tests one pair on one loss series, with the Harvey,
-Leybourne and Newbold (1997) small-sample correction. `dm_test` does the same
-for a long-format forecast table with many series, by averaging the loss
-difference across series at each time stamp. `model_confidence_set` keeps the
-set of models that cannot be told apart from the best (Hansen, Lunde and
-Nason 2011), using a moving-block bootstrap and the T_max statistic.
+Leybourne and Newbold (1997) small-sample correction; if the long-run
+variance comes out negative with h > 1, Newey-West weights are used instead. `dm_test` does the same
+for a long-format backtest with many series: with a ``cutoff`` column (as in
+statsforecast / mlforecast cross-validation output) every forecast origin is
+one observation, because the errors of the steps that share an origin are
+correlated, and overlapping windows are thinned to non-overlapping ones. `model_confidence_set` keeps the set of models that cannot be told
+apart from the best (Hansen, Lunde and Nason 2011), using a circular block
+bootstrap and the T_max statistic.
 """
 from __future__ import annotations
 
+import math
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -29,30 +34,48 @@ class DMResult:
     p_value: float
     mean_loss_diff: float
     n: int
+    h: int = 1
 
     def __str__(self):
-        side = "A worse" if self.mean_loss_diff > 0 else "A better"
-        return (f"DM = {self.statistic:.3f}, p = {self.p_value:.4f} over {self.n} points "
+        if self.mean_loss_diff > 0:
+            side = "A worse"
+        elif self.mean_loss_diff < 0:
+            side = "A better"
+        else:
+            side = "no difference"
+        return (f"DM = {self.statistic:.3f}, p = {self.p_value:.4f} over {self.n} points, h = {self.h} "
                 f"(mean loss difference {self.mean_loss_diff:.4g}, {side})")
 
 
 def _dm_from_diff(d, h):
+    if h < 1:
+        raise ValueError("h must be at least 1")
     d = np.asarray(d, dtype=float)
-    d = d[~np.isnan(d)]
+    if np.isinf(d).any():
+        raise ValueError("loss differences contain inf")
+    if np.isnan(d).any():
+        if h > 1:
+            raise ValueError("loss differences contain NaN; with h > 1 dropping them would misalign the lags")
+        d = d[~np.isnan(d)]
     n = d.size
     if n < 3:
         raise ValueError("need at least 3 loss differences")
+    if h >= n:
+        raise ValueError(f"h = {h} needs more than {h} loss differences, got {n}")
     mean = d.mean()
     dc = d - mean
-    var = dc @ dc / n
-    for k in range(1, h):
-        var += 2.0 * (dc[k:] @ dc[:-k]) / n
+    gamma = [dc @ dc / n] + [(dc[k:] @ dc[:-k]) / n for k in range(1, h)]
+    var = gamma[0] + 2.0 * sum(gamma[1:])
+    if var <= 0 and h > 1:
+        # The rectangular long-run variance can turn negative; fall back to
+        # Newey-West (Bartlett) weights, which keep it positive.
+        var = gamma[0] + 2.0 * sum((1 - k / h) * gamma[k] for k in range(1, h))
     if var <= 0:
-        return DMResult(np.nan, np.nan, float(mean), n)
+        return DMResult(np.nan, np.nan, float(mean), n, h)
     stat = mean / np.sqrt(var / n)
     stat *= np.sqrt((n + 1 - 2 * h + h * (h - 1) / n) / n)  # HLN correction
     p = 2.0 * stats.t.sf(abs(stat), df=n - 1)
-    return DMResult(float(stat), float(p), float(mean), n)
+    return DMResult(float(stat), float(p), float(mean), n, h)
 
 
 def diebold_mariano(errors_a, errors_b, h=1, loss="squared") -> DMResult:
@@ -69,28 +92,82 @@ def diebold_mariano(errors_a, errors_b, h=1, loss="squared") -> DMResult:
     return _dm_from_diff(_LOSSES[loss](ea) - _LOSSES[loss](eb), h)
 
 
-def dm_test(df, model_a, model_b, *, y="y", id_col="unique_id", time_col="ds", h=1,
-            loss="squared") -> DMResult:
-    """Diebold-Mariano on a long-format table of many series.
+def origin_means(values, cutoff, time):
+    """Mean of `values` per forecast origin, thinned to origins whose windows do not overlap.
 
-    ``df`` has one row per series and time stamp, with the actual in ``y`` and
-    one column per model (the layout of statsforecast/mlforecast
-    ``cross_validation`` output). The loss difference is averaged across
-    series at each time stamp, then tested as one series.
+    Returns (series indexed by cutoff, overlap) where overlap is
+    ceil(horizon / spacing between cutoffs). When windows overlap, only every
+    overlap-th origin is kept, counting back from the latest, so the kept
+    origins share no target dates and their means are close to independent.
+    """
+    per = pd.Series(np.asarray(values, dtype=float)).groupby(np.asarray(cutoff)).mean().sort_index()
+    cuts = per.index.to_numpy()
+    if len(cuts) < 2:
+        return per, 1
+    horizon = (pd.Series(np.asarray(time)) - pd.Series(np.asarray(cutoff))).max()
+    step = pd.Series(cuts).diff().dropna().min()
+    overlap = max(1, int(math.ceil(horizon / step))) if step else 1
+    if overlap > 1:
+        keep = np.arange(len(per) - 1, -1, -overlap)[::-1]
+        per = per.iloc[keep]
+    return per, overlap
+
+
+def dm_test(df, model_a, model_b, *, y="y", id_col="unique_id", time_col="ds", cutoff_col="cutoff",
+            h=None, loss="squared") -> DMResult:
+    """Diebold-Mariano on a long-format backtest of many series.
+
+    With a ``cutoff_col`` column, the loss difference is averaged over all
+    series and steps of each forecast origin, and the test runs across
+    origins. If the windows overlap (origins closer together than the
+    horizon, such as statsforecast's default ``step_size=1``), only origins
+    whose windows do not overlap are kept, because overlapping windows share
+    target dates and a lag allowance does not hold the test's size. At least
+    3 kept origins are needed; for a useful test, backtest with
+    ``step_size`` at least the horizon and ten or more windows.
+
+    Without a cutoff column, every time stamp is treated as a separate forecast
+    origin and ``h`` defaults to 1. Only use that for genuine one-step-ahead
+    forecasts: steps of one multi-step forecast are correlated and the test
+    would reject far too often.
     """
     if loss not in _LOSSES:
         raise ValueError(f"loss must be one of {list(_LOSSES)}")
+    missing = [c for c in [y, id_col, time_col, model_a, model_b] if c not in df.columns]
+    if missing:
+        raise KeyError(f"columns not found: {missing}")
     f = _LOSSES[loss]
     d = f(df[model_a] - df[y]) - f(df[model_b] - df[y])
-    per_time = d.groupby(df[time_col]).mean().sort_index()
-    return _dm_from_diff(per_time.to_numpy(), h)
+    if cutoff_col and cutoff_col in df.columns:
+        per, overlap = origin_means(d, df[cutoff_col], df[time_col])
+        if overlap > 1:
+            warnings.warn(f"forecast windows overlap; using {len(per)} non-overlapping origins of "
+                          f"{df[cutoff_col].nunique()}", stacklevel=2)
+        if len(per) < 3:
+            raise ValueError(f"only {len(per)} non-overlapping forecast origins; the test needs at least 3. "
+                             "Backtest with more windows, spaced at least the horizon apart.")
+        if len(per) < 10:
+            warnings.warn(f"dm_test across only {len(per)} forecast origins has little power", stacklevel=2)
+        return _dm_from_diff(per.to_numpy(), 1 if h is None else h)
+    if df.duplicated([id_col, time_col]).any():
+        raise ValueError("duplicate (id, time) rows, as from overlapping cross-validation windows; "
+                         f"pass the forecast origin as {cutoff_col!r}")
+    per = d.groupby(df[time_col], observed=True).mean().sort_index()
+    return _dm_from_diff(per.to_numpy(), 1 if h is None else h)
 
 
-def _block_indices(n, block, reps, rng):
+def _boot_means(vals, block, reps, rng, chunk_cells=5_000_000):
+    """Circular block bootstrap means, (reps, m), without materialising reps × n × m."""
+    n, m = vals.shape
     n_blocks = int(np.ceil(n / block))
-    starts = rng.integers(0, n, size=(reps, n_blocks))
-    idx = (starts[:, :, None] + np.arange(block)[None, None, :]) % n
-    return idx.reshape(reps, -1)[:, :n]
+    out = np.empty((reps, m))
+    chunk = max(1, chunk_cells // max(1, n * m))
+    for start in range(0, reps, chunk):
+        r = min(chunk, reps - start)
+        starts = rng.integers(0, n, size=(r, n_blocks))
+        idx = ((starts[:, :, None] + np.arange(block)[None, None, :]) % n).reshape(r, -1)[:, :n]
+        out[start:start + r] = vals[idx].mean(axis=1)
+    return out
 
 
 def model_confidence_set(losses, size=0.10, reps=2000, block_size=None, random_state=None):
@@ -99,11 +176,11 @@ def model_confidence_set(losses, size=0.10, reps=2000, block_size=None, random_s
     Parameters
     ----------
     losses : DataFrame of shape (n_times, n_models), one column per model,
-        each cell that model's loss at that time. For many series, average the
-        loss across series per time stamp first.
+        each cell that model's loss at that time (or forecast origin), in time
+        order. For many series, average the loss across series first.
     size : the test size; models whose MCS p-value is at least ``size`` stay
         in the set.
-    block_size : moving-block length for the bootstrap. Defaults to
+    block_size : block length for the circular block bootstrap. Defaults to
         ``ceil(n_times ** (1/3))``.
 
     Returns
@@ -112,17 +189,18 @@ def model_confidence_set(losses, size=0.10, reps=2000, block_size=None, random_s
     first eliminated to last.
     """
     L = pd.DataFrame(losses).astype(float)
-    if L.isna().any().any():
-        raise ValueError("losses contain missing values")
+    if not np.isfinite(L.to_numpy()).all():
+        raise ValueError("losses contain missing or infinite values")
     n, m = L.shape
     if m < 2:
         raise ValueError("need at least two models")
+    if n < 3:
+        raise ValueError("need at least 3 time points")
     block = block_size or int(np.ceil(n ** (1 / 3)))
     rng = np.random.default_rng(random_state)
-    idx = _block_indices(n, block, reps, rng)
     vals = L.to_numpy()
-    lbar = vals.mean(axis=0)                       # (m,)
-    lboot = vals[idx].mean(axis=1)                 # (reps, m)
+    lbar = vals.mean(axis=0)
+    lboot = _boot_means(vals, block, reps, rng)
 
     included = list(range(m))
     order, pvals = [], []

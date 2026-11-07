@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -125,7 +127,7 @@ def test_mcs_agrees_with_arch():
     arch = pytest.importorskip("arch.bootstrap")
     L = _losses()
     ours = fl.model_confidence_set(L, size=0.10, reps=2000, block_size=8, random_state=0)
-    ref = arch.MCS(L, size=0.10, reps=2000, block_size=8, method="max", bootstrap="mbb", seed=0)
+    ref = arch.MCS(L, size=0.10, reps=2000, block_size=8, method="max", bootstrap="cbb", seed=0)
     ref.compute()
     assert set(ours.index[ours["in_set"]]) == set(ref.included)
 
@@ -163,17 +165,41 @@ def test_group_time_split_validates_inputs():
         next(fl.GroupTimeSplit(t).split(np.zeros(len(g))))
 
 
-# ── split optimism: a leak through the entity shows up ──────────────────────
-def test_split_optimism_exposes_entity_leak():
-    rng = np.random.default_rng(4)
-    g, t = _panel(n_groups=40, n_times=24)
-    level = rng.normal(0, 5, 40)
-    y = level[g] + 0.05 * t + rng.normal(0, 0.5, len(g))
-    X = np.column_stack([g, t])  # the group code lets a model memorise each entity
-    model = RandomForestRegressor(n_estimators=50, random_state=0)
-    out = fl.split_optimism(model, X, y, groups=g, time=t, n_splits=3)
-    assert out.loc["random", "vs_reference"] < 0.5   # random CV hides most of the error
-    assert out.loc["group", "vs_reference"] > 0.7
+# ── split optimism: matched comparisons ─────────────────────────────────
+def _shock_panel(seed=4, n_groups=40, n_times=60):
+    rng = np.random.default_rng(seed)
+    g, t = _panel(n_groups=n_groups, n_times=n_times)
+    level = rng.normal(0, 1, n_groups)
+    shock = rng.normal(0, 3, n_times)          # a daily shock every item shares
+    y = level[g] + shock[t] + rng.normal(0, 0.5, len(g))
+    return np.column_stack([g, t]).astype(float), y, g, t
+
+
+def test_split_optimism_exposes_cross_series_leak():
+    X, y, g, t = _shock_panel()
+    out = fl.split_optimism(RandomForestRegressor(n_estimators=60, random_state=0), X, y,
+                            groups=g, time=t, n_splits=4)
+    # same-day rows of other items reveal the shock: both leaky splits look far better
+    assert out.loc["random", "optimism"] > 0.3
+    assert out.loc["group", "optimism"] > 0.2
+    assert out.loc["random", "honest"] == "time"
+
+
+def test_split_optimism_is_near_zero_without_a_leak():
+    from sklearn.neighbors import KNeighborsRegressor
+    rng = np.random.default_rng(5)
+    g, t = _panel(n_groups=40, n_times=60)
+    X = rng.normal(size=(len(g), 3))
+    y = X[:, 0] + rng.normal(0, 1, len(g))     # no dependence on group or time
+    out = fl.split_optimism(KNeighborsRegressor(5), X, y, groups=g, time=t, n_splits=4)
+    assert abs(out.loc["random", "optimism"]) < 0.08
+    assert abs(out.loc["group", "optimism"]) < 0.08
+
+
+def test_split_optimism_rejects_score_metrics():
+    X, y, g, t = _shock_panel()
+    with pytest.raises(ValueError, match="neg_"):
+        fl.split_optimism(RandomForestRegressor(n_estimators=5), X, y, groups=g, time=t, scoring="r2")
 
 
 # ── demand classes (Syntetos-Boylan cut-offs 1.32 and 0.49) ─────────────────
@@ -182,8 +208,8 @@ def test_classify_demand_four_classes():
     series = {
         "smooth": [5, 5, 5, 5, 5, 5],            # ADI 1, CV2 0
         "erratic": [1, 9, 1, 9, 1, 9],           # ADI 1, CV2 0.64
-        "intermittent": [0, 0, 5, 0, 0, 5],      # ADI 3, CV2 0
-        "lumpy": [0, 0, 1, 0, 0, 9],             # ADI 3, CV2 0.64
+        "intermittent": [5, 0, 0, 5, 0, 0],      # ADI 3, CV2 0
+        "lumpy": [0, 0, 1, 0, 0, 9],             # ADI 2 from first demand, CV2 0.64
         "none": [0, 0, 0, 0, 0, 0],
     }
     for k, v in series.items():
@@ -194,7 +220,7 @@ def test_classify_demand_four_classes():
     assert out.loc["intermittent", "demand_class"] == "intermittent"
     assert out.loc["lumpy", "demand_class"] == "lumpy"
     assert out.loc["none", "demand_class"] == "no demand"
-    assert out.loc["lumpy", "adi"] == pytest.approx(3.0)
+    assert out.loc["lumpy", "adi"] == pytest.approx(2.0)   # (6 periods − first demand at 2) / 2 demands
     assert out.loc["lumpy", "cv2"] == pytest.approx(0.64)
 
 
@@ -238,3 +264,234 @@ def test_audit_by_segment():
     assert seg.loc[("m", "fast"), "fva"] == pytest.approx(0.5)
     assert seg.loc[("m", "slow"), "fva"] == pytest.approx(-1.5)
     assert "by segment" in str(rep)
+
+
+# ── review fixes ────────────────────────────────────────────────────────────
+def test_bias_flag_has_the_right_null_rate():
+    rng = np.random.default_rng(7)
+    rows = []
+    for i in range(500):
+        e = rng.normal(0, 1, 28)
+        rows += [{"unique_id": i, "ds": t, "y": 10.0, "m": 10.0 + e[t]} for t in range(28)]
+    rep = fl.audit(pd.DataFrame(rows), ["m"])
+    assert rep.summary.loc["m", "share_biased_items"] < 0.09   # about 5% expected under no bias
+
+
+def _cv_panel(rng, n_series=30, n_cut=20, horizon=7, step=7, effect=0.0):
+    rows = []
+    for c in range(n_cut):
+        for i in range(n_series):
+            shock = rng.normal(0, 1)                         # shared by all steps of one origin
+            for k in range(1, horizon + 1):
+                ds = c * step + k
+                y = 10.0
+                rows.append({"unique_id": i, "ds": ds, "cutoff": c * step, "y": y,
+                             "A": y + shock + rng.normal(0, 1), "B": y + shock + rng.normal(0, 1) + effect})
+    return pd.DataFrame(rows)
+
+
+def test_dm_test_uses_cutoffs_and_holds_size():
+    rng = np.random.default_rng(8)
+    rejections = 0
+    for _ in range(60):
+        r = fl.dm_test(_cv_panel(rng), "A", "B")
+        rejections += r.p_value < 0.05
+    assert rejections / 60 < 0.15                    # was 0.46 when steps counted as separate points
+    r = fl.dm_test(_cv_panel(rng, effect=1.0), "A", "B")
+    assert r.n == 20 and r.p_value < 0.01 and r.statistic < 0
+
+
+def test_dm_test_thins_overlapping_windows():
+    rng = np.random.default_rng(9)
+    df = _cv_panel(rng, n_cut=12, horizon=14, step=7)
+    with pytest.warns(UserWarning, match="non-overlapping"):
+        r = fl.dm_test(df, "A", "B")
+    assert r.n == 6 and r.h == 1
+
+
+def _daily_origin_null(rng, n_series=20, n_dates=80, horizon=7, n_cut=40):
+    """Equally good models; each model's error at a target date is shared by every
+    origin that covers it, as in a real rolling backtest with step 1."""
+    ea = rng.normal(0, 1, (n_series, n_dates))
+    eb = rng.normal(0, 1, (n_series, n_dates))
+    rows = []
+    for c in range(n_cut):
+        for i in range(n_series):
+            for k in range(1, horizon + 1):
+                t = c + k
+                rows.append((i, t, c, 0.0, ea[i, t], eb[i, t]))
+    return pd.DataFrame(rows, columns=["unique_id", "ds", "cutoff", "y", "A", "B"])
+
+
+def test_dm_test_size_with_daily_origins():
+    rng = np.random.default_rng(12)
+    rej = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(150):
+            rej += fl.dm_test(_daily_origin_null(rng), "A", "B").p_value < 0.05
+    assert rej / 150 < 0.10                       # was 0.17 with a lag allowance instead of thinning
+
+
+def test_dm_test_refuses_duplicates_without_cutoff():
+    rng = np.random.default_rng(10)
+    df = _cv_panel(rng, n_cut=5, horizon=14, step=7).drop(columns="cutoff")
+    with pytest.raises(ValueError, match="duplicate"):
+        fl.dm_test(df, "A", "B")
+    with pytest.raises(KeyError):
+        fl.dm_test(df.assign(cutoff=0), "A", "B", id_col="nope")
+
+
+def test_dm_edge_cases():
+    with pytest.raises(ValueError):
+        fl.diebold_mariano([1, 2, 3, 4], [0, 0, 0, 0], h=0)
+    with pytest.raises(ValueError, match="NaN"):
+        fl.diebold_mariano([1, np.nan, 3, 4, 5], [0, 0, 0, 0, 0], h=2)
+    assert "no difference" in str(fl.DMResult(0.0, 1.0, 0.0, 5))
+
+
+def test_rmsse_follows_m5_and_ignores_leading_zeros():
+    train = pd.DataFrame({"unique_id": "a", "ds": range(10), "y": [0, 0, 0, 0, 0, 0, 2, 4, 2, 4.0]})
+    test = pd.DataFrame({"unique_id": "a", "ds": [10, 11], "y": [2.0, 4], "m": [3.0, 3]})
+    assert fl.audit(test, ["m"], train=train).summary.loc["m", "rmsse"] == pytest.approx(0.5)
+
+
+def test_scale_skips_gaps_in_time():
+    train = pd.DataFrame({"unique_id": "a", "ds": [0, 1, 2, 10, 11, 12], "y": [1.0, 2, 3, 50, 51, 52]})
+    test = pd.DataFrame({"unique_id": "a", "ds": [13], "y": [53.0], "m": [54.0]})
+    assert fl.audit(test, ["m"], train=train).summary.loc["m", "mase"] == pytest.approx(1.0)
+
+
+def test_adi_counts_from_first_demand():
+    df = pd.DataFrame({"unique_id": "new", "ds": range(12), "y": [0] * 8 + [5, 5, 5, 5]})
+    out = fl.classify_demand(df)
+    assert out.loc["new", "adi"] == pytest.approx(1.0)
+    assert out.loc["new", "demand_class"] == "smooth"
+
+
+def test_audit_categorical_ids_have_no_phantom_items():
+    df = _eight_days()
+    df["unique_id"] = pd.Categorical(df["unique_id"], categories=["sku1", "unused"])
+    rep = fl.audit(df, ["H"], baseline="N")
+    assert rep.summary.loc["H", "n_items"] == 1
+
+
+def test_audit_drops_missing_rows_for_every_model():
+    df = pd.DataFrame({"unique_id": "a", "ds": range(4), "y": [10.0, 10, 10, 100],
+                       "m": [11.0, 11, 11, np.nan], "base": [12.0, 12, 12, 100]})
+    rep = fl.audit(df, ["m"], baseline="base")
+    assert rep.n_missing == 1
+    assert rep.summary.loc["m", "fva"] == pytest.approx(0.5)
+    assert rep.summary.loc["m", "pct_bias"] == pytest.approx(0.1)
+
+
+def test_exclude_column_types():
+    df = _eight_days()
+    df["flag"] = pd.array([None, None] + [False] * 6, dtype="boolean")
+    assert fl.audit(df, ["H"], exclude="flag").n_excluded == 0
+    df["flag"] = ["False"] * 8
+    with pytest.raises(TypeError):
+        fl.audit(df, ["H"], exclude="flag")
+
+
+def test_zero_error_baseline_gives_no_fva():
+    df = pd.DataFrame({"unique_id": ["a"] * 3 + ["b"] * 3, "ds": [0, 1, 2] * 2, "y": [1.0] * 6,
+                       "m": [2.0, 2, 2, 1.5, 1.5, 1.5], "base": [1.0, 1, 1, 3, 3, 3]})
+    rep = fl.audit(df, ["m"], baseline="base")
+    pi = rep.per_item.set_index(["model", "unique_id"])
+    assert np.isnan(pi.loc[("m", "a"), "fva"])
+    assert rep.summary.loc["m", "share_items_worse"] == pytest.approx(0.0)
+
+
+def test_mismatched_ids_are_reported():
+    train = pd.DataFrame({"unique_id": 1, "ds": range(5), "y": [1.0, 2, 3, 4, 5]})
+    test = pd.DataFrame({"unique_id": "1", "ds": [5], "y": [6.0], "m": [7.0]})
+    with pytest.warns(UserWarning, match="same id"):
+        rep = fl.audit(test, ["m"], train=train)
+    assert any("no usable history" in n for n in rep.notes)
+
+
+def test_concentration_label_uses_actual_count():
+    rows = [{"unique_id": i, "ds": 0, "y": 0.0, "m": float(i + 1)} for i in range(2)]
+    rep = fl.audit(pd.DataFrame(rows), ["m"])
+    assert "top 1 of 2 items" in str(rep)
+
+
+def test_noise_floor_validation():
+    with pytest.raises(ValueError):
+        fl.noise_floor(lambda s: float(s), seeds=[0, 1, 2], confidence=95)
+    with pytest.raises(ValueError, match="NaN"):
+        fl.noise_floor(lambda s: [1.0, np.nan, 2.0][s], seeds=[0, 1, 2])
+
+
+def test_group_time_split_rejects_bad_input():
+    g, t = _panel()
+    t = t.astype(float)
+    t[0] = np.nan
+    with pytest.raises(ValueError, match="missing"):
+        next(fl.GroupTimeSplit(t).split(np.zeros(len(g)), groups=g))
+    with pytest.raises(ValueError):
+        fl.GroupTimeSplit(t, test_size=0)
+
+
+def test_bias_flag_null_rate_with_overlapping_origins():
+    rng = np.random.default_rng(11)
+    df = _cv_panel(rng, n_series=300, n_cut=20, horizon=14, step=7)
+    assert fl.audit(df, ["A"]).summary.loc["A", "share_biased_items"] < 0.12
+
+
+def test_dm_falls_back_when_variance_is_negative():
+    d = np.array([1.0, -1.0] * 6) + 0.5        # strong negative lag-1 autocorrelation
+    r = fl.diebold_mariano(np.sqrt(np.clip(d, 0, None)), np.sqrt(np.clip(-d, 0, None)), h=2)
+    assert np.isfinite(r.statistic) and np.isfinite(r.p_value)
+
+
+
+def test_bias_flag_size_with_daily_origins():
+    rng = np.random.default_rng(13)
+    df = _daily_origin_null(rng, n_series=300, n_dates=200, horizon=7, n_cut=150)
+    assert fl.audit(df, ["A"]).summary.loc["A", "share_biased_items"] < 0.10
+
+
+def test_bias_not_tested_with_too_few_origins():
+    rng = np.random.default_rng(14)
+    df = _cv_panel(rng, n_cut=2, horizon=7, step=7)
+    rep = fl.audit(df, ["A"])
+    assert rep.summary.loc["A", "n_biased_items"] == 0
+    assert rep.per_item["bias_pvalue"].isna().all()
+    assert any("not tested" in n for n in rep.notes)
+
+
+def test_bias_tolerance_is_relative():
+    rows = []
+    for c, e in enumerate([1e-9, -1e-9, 1e-9, -1e-9]):
+        rows.append({"unique_id": "a", "ds": c * 7 + 1, "cutoff": c * 7, "y": 0.0, "m": e})
+    rep = fl.audit(pd.DataFrame(rows), ["m"])
+    assert rep.per_item.loc[0, "bias_pvalue"] > 0.05
+
+
+def test_stockouts_do_not_drive_the_demand_class():
+    train = pd.DataFrame({"unique_id": "a", "ds": range(8), "y": [5.0, 0, 0, 0, 5, 5, 5, 5],
+                          "stockout": [False, True, True, True, False, False, False, False]})
+    test = pd.DataFrame({"unique_id": "a", "ds": [8], "y": [5.0], "m": [5.5], "stockout": [False]})
+    rep = fl.audit(test, ["m"], train=train, exclude="stockout", segments="demand_class")
+    assert rep.per_item.loc[0, "segment"] == "smooth"
+
+
+def test_exclude_accepts_zero_one_flags():
+    df = _eight_days()
+    df["flag"] = [1] + [0] * 7
+    assert fl.audit(df, ["H"], exclude="flag").n_excluded == 1
+
+
+def test_split_optimism_exposes_entity_leak():
+    rng = np.random.default_rng(4)
+    g, t = _panel(n_groups=40, n_times=24)
+    level = rng.normal(0, 5, 40)
+    y = level[g] + rng.normal(0, 0.5, len(g))
+    X = np.column_stack([g, t]).astype(float)  # the entity code lets a model memorise each entity
+    out = fl.split_optimism(RandomForestRegressor(n_estimators=50, random_state=0), X, y,
+                            groups=g, time=t, n_splits=3)
+    assert out.loc["kfold", "optimism"] > 0.6     # plain K-fold hides most of the error
+    assert out.loc["kfold", "honest"] == "group"
+    assert abs(out.loc["random", "optimism"]) < 3 * out.loc["random", "optimism_se"] + 0.05

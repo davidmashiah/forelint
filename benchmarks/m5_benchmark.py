@@ -3,9 +3,9 @@
 Usage:  python benchmarks/m5_benchmark.py path/to/m5.zip [STORE] [DEPT]
 
 Reads the public M5 sales file (from the Kaggle competition or Nixtla's
-mirror), keeps one store and department, and builds a direct 28-day-ahead
-global model with scikit-learn. Every number this prints is measured on that
-data; nothing is assumed.
+mirror), keeps one store and department, and backtests a direct 28-day-ahead
+global model from scikit-learn at 10 forecast origins 28 days apart. Every
+number this prints is measured on that data; nothing is assumed.
 """
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 import forelint as fl
 
 H = 28          # forecast horizon, as in M5
-HISTORY = 420   # days of history kept
+HISTORY = 730   # days of history kept
+N_ORIGINS = 10  # rolling forecast origins
+STEP = 28       # days between origins: no overlap with the 28-day horizon
 
 
 def load(path, store, dept):
@@ -48,48 +50,58 @@ def features(df):
 FEATS = ["item", "dow", "lag28", "lag35", "rmean7", "rmean28"]
 
 
+def gbm(seed=0, **kw):
+    return HistGradientBoostingRegressor(max_iter=200, random_state=seed, **kw)
+
+
 def main(path, store="CA_1", dept="FOODS_3"):
     t0 = time.time()
     df = features(load(path, store, dept))
     print(f"M5 {store} {dept}: {df.item_id.nunique()} items, {df.ds.nunique()} days, {len(df):,} rows\n")
     X, y = df[FEATS].to_numpy(float), df["y"].to_numpy(float)
-    model = HistGradientBoostingRegressor(max_iter=200, random_state=0)
 
-    # 1. How much each split strategy flatters the model.
-    opt = fl.split_optimism(model, X, y, groups=df["item"].to_numpy(), time=df["ds"].to_numpy(),
-                            reference="time", n_splits=5, gap=0, random_state=0)
-    print("1. split optimism (MAE; reference = time split, the way the model is used)")
+    # 1. Does a leaky split flatter the model? Matched test rows and training size.
+    opt = fl.split_optimism(gbm(), X, y, groups=df["item"].to_numpy(), time=df["ds"].to_numpy(),
+                            n_splits=5, random_state=0)
+    print("1. split optimism (MAE; each leaky split against its honest counterpart)")
     print(opt.round(4).to_string(), "\n")
 
-    # Final holdout: the last 28 days.
-    cut = df.ds.max() - H
-    tr, te = df[df.ds <= cut], df[df.ds > cut].copy()
+    # Rolling origins as a cross-validation table with a cutoff column.
+    last = df.ds.max() - H
+    cutoffs = [last - STEP * k for k in range(N_ORIGINS - 1, -1, -1)]
+    frames = []
+    for c in cutoffs:
+        tr, te = df[df.ds <= c], df[(df.ds > c) & (df.ds <= c + H)].copy()
+        te["GBM"] = gbm().fit(tr[FEATS], tr["y"]).predict(te[FEATS])
+        te["Naive28"] = te["lag28"]
+        te["MA28"] = te["item_id"].map(tr.groupby("item_id")["y"].apply(lambda s: s.iloc[-28:].mean()))
+        te["cutoff"] = c
+        frames.append(te)
+    cv = pd.concat(frames, ignore_index=True)
+    hist = df[df.ds <= cutoffs[0]][["item_id", "ds", "y"]]
+    print(f"rolling origins: {N_ORIGINS} cutoffs {STEP} days apart, {H} days ahead, {len(cv):,} forecast rows\n")
 
-    # 2. Run-to-run noise floor: same data, same settings, different seeds.
+    # 2. Run-to-run noise floor at the last origin: same data, different seeds.
+    tr, te = df[df.ds <= last], df[df.ds > last]
+
     def run(seed):
-        m = HistGradientBoostingRegressor(max_iter=200, random_state=seed, early_stopping=True)
-        m.fit(tr[FEATS], tr["y"])
+        m = gbm(seed, early_stopping=True).fit(tr[FEATS], tr["y"])
         return float(np.abs(m.predict(te[FEATS]) - te["y"]).mean())
     nf = fl.noise_floor(run, seeds=range(10))
     print("2.", nf)
     print(f"   run MAEs: {np.round(nf.scores, 4).tolist()}\n")
 
-    # 3. Audit against two naive baselines.
-    m = HistGradientBoostingRegressor(max_iter=200, random_state=0).fit(tr[FEATS], tr["y"])
-    te["GBM"] = m.predict(te[FEATS])
-    te["Naive28"] = te["lag28"]
-    last = tr.groupby("item_id")["y"].apply(lambda s: s.iloc[-28:].mean())
-    te["MA28"] = te["item_id"].map(last)
-    hist = df[df.ds <= cut][["item_id", "ds", "y"]]
-    rep = fl.audit(te, ["GBM", "Naive28"], baseline="MA28", y="y", id_col="item_id", time_col="ds",
+    # 3. Audit against two naive baselines, by demand class.
+    rep = fl.audit(cv, ["GBM", "Naive28"], baseline="MA28", id_col="item_id",
                    train=hist, segments="demand_class")
     print("3.", rep, "\n")
 
-    # 4. Is the GBM really better than the moving average?
-    print("4. Diebold-Mariano, GBM vs MA28 (squared loss, h = 1 on the per-day mean):")
-    print("  ", fl.dm_test(te, "GBM", "MA28", id_col="item_id"))
-    losses = pd.DataFrame({c: ((te[c] - te["y"]) ** 2).groupby(te["ds"]).mean() for c in ["GBM", "Naive28", "MA28"]})
-    print("   model confidence set (10%):")
+    # 4. Is the GBM really better than the moving average? One point per origin.
+    print("4. Diebold-Mariano, GBM vs MA28 (squared loss, across origins):")
+    print("  ", fl.dm_test(cv, "GBM", "MA28", id_col="item_id"))
+    losses = pd.DataFrame({m: ((cv[m] - cv["y"]) ** 2).groupby(cv["cutoff"]).mean()
+                           for m in ["GBM", "Naive28", "MA28"]})
+    print("   model confidence set (10%), one point per origin:")
     print(fl.model_confidence_set(losses, size=0.10, random_state=0).round(4).to_string())
     print(f"\nran in {time.time() - t0:.0f} s")
 

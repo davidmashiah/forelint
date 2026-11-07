@@ -53,6 +53,14 @@ nf = fl.noise_floor(lambda seed: train_and_score(seed), seeds=range(10))
 nf.is_meaningful(new_mae - old_mae)
 ```
 
+## With statsforecast
+
+`examples/statsforecast_cv.py` runs `StatsForecast.cross_validation` with AutoETS,
+Croston, seasonal naive and naive on 60 daily series, then audits the output
+as it comes out. AutoETS wins overall and is the only model left in the
+confidence set, yet on the intermittent series it is still worse than the
+naive forecast on 59% of items. That is the kind of result an average hides.
+
 ## On real data: one Walmart store in M5
 
 `benchmarks/m5_benchmark.py` runs every check on the public M5 data: store

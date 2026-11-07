@@ -34,10 +34,13 @@ classifiers = [
 
 [project.optional-dependencies]
 test = ["pytest>=7", "arch>=6"]
+examples = ["statsforecast>=1.7"]
 
 [project.urls]
 Homepage = "https://github.com/davidmashiah/forelint"
 Source = "https://github.com/davidmashiah/forelint"
+Changelog = "https://github.com/davidmashiah/forelint/blob/main/CHANGELOG.md"
+DOI = "https://doi.org/10.5281/zenodo.24044927"
 Author = "https://davidmashiah.com/"
 
 [tool.hatch.build.targets.wheel]
